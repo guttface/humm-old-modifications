@@ -1,0 +1,207 @@
+# ============================================================
+# Huum Sauna — Home Assistant Integration
+# Controller address: http://huum-controller:52018
+#
+# Strategy: one REST sensor polls /status and stores all JSON
+# fields as attributes. Template sensors/binary_sensors then
+# derive their values from those attributes — so the sauna
+# controller only receives one HTTP request per scan_interval.
+# ============================================================
+
+# ------------------------------------------------------------------
+# PRIMARY REST SENSOR
+# Polls /status and makes all fields available as attributes.
+# The sensor's own state is the current temperature (most useful
+# for dashboards and history graphs).
+# ------------------------------------------------------------------
+sensor:
+  - platform: rest
+    name: Sauna Status
+    unique_id: sauna_status
+    resource: http://huum-controller:52018/status
+    method: GET
+    scan_interval: 60             # Match your controller's UPDATE_FREQUENCY
+
+    # Primary state value
+    value_template: "{{ value_json.temperature | int(0) }}"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+
+    # All other fields stored as attributes for template sensors below
+    json_attributes:
+      - temperatureSetpoint
+      - sensorReadingTimestamp
+      - isOnline
+      - isHeating
+      - heatingEndTime
+
+# ------------------------------------------------------------------
+# TEMPLATE ENTITIES
+# Derived from the single REST poll above — no extra HTTP calls.
+# ------------------------------------------------------------------
+template:
+  - sensor:
+      # Temperature setpoint (what the heater is targeting)
+      - name: Sauna Temperature Setpoint
+        unique_id: sauna_temperature_setpoint
+        unit_of_measurement: "°C"
+        device_class: temperature
+        state_class: measurement
+        state: >
+          {{ state_attr('sensor.sauna_status', 'temperatureSetpoint') | int(0) }}
+        availability: >
+          {{ states('sensor.sauna_status') not in ['unavailable', 'unknown'] }}
+
+      # Last sensor reading timestamp (ISO string → HA timestamp)
+      - name: Sauna Last Sensor Reading
+        unique_id: sauna_last_sensor_reading
+        device_class: timestamp
+        state: >
+          {{ state_attr('sensor.sauna_status', 'sensorReadingTimestamp') }}
+        availability: >
+          {{ state_attr('sensor.sauna_status', 'sensorReadingTimestamp') is not none }}
+
+      # Auto-off time (null when not heating)
+      - name: Sauna Heating End Time
+        unique_id: sauna_heating_end_time
+        device_class: timestamp
+        state: >
+          {{ state_attr('sensor.sauna_status', 'heatingEndTime') }}
+        availability: >
+          {{ state_attr('sensor.sauna_status', 'heatingEndTime') is not none }}
+
+      # Status that combines online and heating status
+      - name: Sauna Display Status
+        unique_id: sauna_display_status
+        state: >
+          {% if not is_state('binary_sensor.sauna_online', 'on') %}
+            Disconnected
+          {% elif is_state('binary_sensor.sauna_heating', 'on') %}
+            Heating
+          {% else %}
+            Idle
+          {% endif %}
+        icon: >
+          {% if not is_state('binary_sensor.sauna_online', 'on') %}
+            mdi:close-circle
+          {% elif is_state('binary_sensor.sauna_heating', 'on') %}
+            mdi:fire
+          {% else %}
+            mdi:check-circle
+          {% endif %}
+
+  - binary_sensor:
+      # Device online (handshake seen + sensor update within 3 minutes)
+      - name: Sauna Online
+        unique_id: sauna_online
+        device_class: connectivity
+        state: >
+          {{ state_attr('sensor.sauna_status', 'isOnline') | bool(false) }}
+        availability: >
+          {{ states('sensor.sauna_status') not in ['unavailable', 'unknown'] }}
+
+      # Currently heating
+      - name: Sauna Heating
+        unique_id: sauna_heating
+        device_class: running
+        state: >
+          {{ state_attr('sensor.sauna_status', 'isHeating') | bool(false) }}
+        availability: >
+          {{ states('sensor.sauna_status') not in ['unavailable', 'unknown'] }}
+
+  - switch:
+      - name: "Sauna"
+        unique_id: sauna_heater_switch
+        optimistic: true
+        state: "{{ is_state('binary_sensor.sauna_heating', 'on') }}"
+        turn_on:
+          - service: rest_command.sauna_start
+            data:
+              target_temperature: "{{ states('input_number.sauna_target_temperature') | int }}"
+              duration_hours: "{{ states('input_number.sauna_duration_hours') | float }}"
+          - delay:
+              seconds: 2
+          - service: homeassistant.update_entity
+            target:
+              entity_id: sensor.sauna_status
+        turn_off:
+          - service: rest_command.sauna_stop
+            data:
+              target_temperature: "{{ states('input_number.sauna_target_temperature') | int }}"
+          - delay:
+              seconds: 2
+          - service: homeassistant.update_entity
+            target:
+              entity_id: sensor.sauna_status
+
+# ------------------------------------------------------------------
+# REST COMMANDS
+# Call these from scripts, automations, or the Developer Tools.
+#
+# Turn on:
+#   service: rest_command.sauna_start
+#   data:
+#     target_temperature: 90
+#     duration_hours: 3
+#
+# Turn off:
+#   service: rest_command.sauna_stop
+#   data:
+#     target_temperature: 90
+# ------------------------------------------------------------------
+rest_command:
+  sauna_start:
+    url: http://huum-controller:52018/start
+    method: POST
+    content_type: "application/json"
+    payload: >
+      {"targetTemperature": {{ target_temperature }}, "durationHours": {{ duration_hours }}}
+
+  sauna_stop:
+    url: http://huum-controller:52018/stop
+    method: POST
+    content_type: "application/json"
+    payload: >
+      {"targetTemperature": {{ target_temperature }}}
+
+# ------------------------------------------------------------------
+# AUTOMATION — notify when sauna is up to temperature
+# ------------------------------------------------------------------
+automation:
+  - alias: "Sauna Ready"
+    description: "Notify when current temp reaches setpoint"
+    trigger:
+      - platform: template
+        value_template: >
+          {{ states('sensor.sauna_status') | int(0)
+             >= state_attr('sensor.sauna_status', 'temperatureSetpoint') | int(999)
+             and is_state('binary_sensor.sauna_heating', 'on') }}
+    action:
+      - service: notify.mobile_app_geoffs_iphone
+        data:
+          title: "🧖 Sauna Ready"
+          message: >
+            Sauna has reached {{ states('sensor.sauna_status') }}°C.
+            Auto-off at {{ states('sensor.sauna_heating_end_time') }}.
+
+# ------------------------------------------------------------------
+# INPUT HELPERS
+# These become controllable sliders in the UI
+# ------------------------------------------------------------------
+input_number:
+  sauna_target_temperature:
+    name: "Sauna Target Temperature"
+    min: 40
+    max: 110
+    step: 1
+    unit_of_measurement: "°C"
+    icon: mdi:thermometer
+
+  sauna_duration_hours:
+    name: "Sauna Duration"
+    min: 1
+    max: 6
+    step: 0.5
+    unit_of_measurement: "h"
+    icon: mdi:clock-outline
